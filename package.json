@@ -66,5 +66,13 @@
     "tailwindcss": "^4.2.1",
     "typescript": "^5.7.2",
     "wrangler": "^4.152.0"
+  },
+"pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "unrs-resolver",
+      "workerd"
+    ]
   }
-}
+} 
+ 
