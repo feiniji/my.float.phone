@@ -1046,19 +1046,6 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
 
     if (minimized) {
         return (
-<<<<<<< HEAD
-            <button
-                type="button"
-                className="call-mini-window"
-                style={{ backgroundImage: `url(${bgImageResolved || resolveChatCharacterAvatar(character)})` }}
-                onClick={onRestore}
-                aria-label={`返回与${character.name}的语音通话`}
-                title="点击返回通话"
-            >
-                <span className="call-mini-window-overlay" />
-                <span className="call-mini-window-name">{character.name}</span>
-            </button>
-=======
             <CallMiniWindow
                 imageUrl={bgImageResolved || character.avatar || null}
                 title={character.name}
@@ -1069,7 +1056,6 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                 onReply={(text) => replyQueue.submit(text) !== "rejected"}
                 pendingCount={replyQueue.pending}
             />
->>>>>>> fork-b/main
         );
     }
 
