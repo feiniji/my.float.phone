@@ -9,8 +9,6 @@ import {
     type LlmToolCall,
 } from "./llm-provider-adapter";
 import { sendLLMToolStreamRequest, type LLMToolRequestResult } from "./chat-engine";
-import { fetchLlmPayload } from "./llm-http";
-import { pushApiLog } from "./api-log-store";
 import type { LLMContentPart } from "./llm-prompt-assembler";
 import { loadApiConfigs, loadBindingConfig } from "./settings-storage";
 import type { ApiConfig } from "./settings-types";
@@ -119,7 +117,12 @@ async function streamQaProviderRequest(
     let reasoning = "";
 
     try {
-        const response = await fetchLlmPayload(request, { signal: llmAbort.signal });
+        const response = await fetch(request.url, {
+            method: "POST",
+            headers: request.headers,
+            body: JSON.stringify(request.body),
+            signal: llmAbort.signal,
+        });
         if (!response.ok) throw new Error(`API Stream ${response.status}: ${await response.text()}`);
         if (!response.body) throw new Error("流式响应没有 body。");
 
@@ -332,39 +335,27 @@ async function requestQaCompletion(
     // 输出护栏：配置了「单次最大输出 token」时每次请求带 max_tokens，
     // 写超被服务端安全截断（agent 循环里会自动续接），而不是拖垮整轮
     const maxTokens = getQaMaxOutputTokens() ?? undefined;
-    // 工坊调用记录：与角色聊天/记忆等底层日志隔离，只进工坊右上角「调用记录」
-    const logQaCall = (entry: { model: string; messages: { role: string; content: string | LLMContentPart[]; marker?: string }[]; rawResponse: string; reasoning?: string }) => {
-        pushApiLog({
-            characterName: "工坊",
-            source: "qa",
-            channel: "qa",
-            model: entry.model,
-            messages: entry.messages.map(m => ({
-                role: m.role,
-                content: typeof m.content === "string" ? m.content : "[vision: 含图片的多模态消息]",
-            })),
-            rawResponse: entry.rawResponse,
-            reasoning: entry.reasoning?.trim() || undefined,
-        });
-    };
     try {
         const streamRequest = buildProviderRequest(apiConfig, null, messages, { stream: true, maxTokens });
         const result = await streamQaProviderRequest(streamRequest, { signal: options?.signal }, options?.callbacks);
         if (!result.content.trim()) throw new Error("LLM 返回了空内容");
-        logQaCall({ model: apiConfig.defaultModel, messages: streamRequest.messagesForLog, rawResponse: result.content, reasoning: result.reasoning });
         return result;
     } catch (streamError) {
         if (options?.signal?.aborted) throw streamError;
         await options?.callbacks?.onStreamFallback?.(formatQaErrorMessage(streamError));
         const request = buildProviderRequest(apiConfig, null, messages, { maxTokens });
-        const response = await fetchLlmPayload(request, { signal: options?.signal });
+        const response = await fetch(request.url, {
+            method: "POST",
+            headers: request.headers,
+            body: JSON.stringify(request.body),
+            signal: options?.signal,
+        });
         if (!response.ok) throw new Error(`API ${response.status}: ${await response.text()}`);
         const parsed = parseProviderResponse(request.providerKind, await response.json());
         const content = stripHallucinatedTimestamps(parsed.content || "").trim();
         if (!content) throw new Error("LLM 返回了空内容");
         const visible = stripThinkBlocks(content);
         if (visible) await options?.callbacks?.onDelta?.(visible);
-        logQaCall({ model: apiConfig.defaultModel, messages: request.messagesForLog, rawResponse: content, reasoning: parsed.reasoning });
         return { content, reasoning: parsed.reasoning || "" };
     }
 }
@@ -400,11 +391,9 @@ export type QaAgentCallbacks = {
     onContentCreated?: (item: QaCreatedContent) => void;
     /** 流过滤器正在缓冲一段长指令（无可见增量）：UI 据此显示"编写工具调用中" */
     onToolDrafting?: (drafting: boolean) => void | Promise<void>;
-    /** 引擎自动续接（截断/CONTINUE 尾标）：UI 据此显示一行提示，用户不再莫名其妙 */
-    onAutoContinue?: (reason: "truncated" | "marked") => void | Promise<void>;
 };
 
-// 单轮工具调用上限：默认 20，可在工坊配置里调节（qa-prefs）
+// 单轮工具调用上限：默认 8，可在工坊配置里调节（qa-prefs）
 
 // 轮数用尽/输出截断时给用户的可见提示——否则未执行的指令被流过滤器隐藏，
 // 表现为"话说到一半突然断了"。截断本身会自动续接，提示只在轮数预算也用完时出现。
@@ -413,7 +402,7 @@ const QA_TRUNCATED_NOTICE = "\n\n（回复被输出长度上限截断，且本�
 
 // 截断/CONTINUE 尾标后的自动接力提示（作为用户不可见的系统消息喂回给模型）
 const QA_AUTO_CONTINUE_TRUNCATED =
-    "你上一条输出到达单次输出上限被截断，残缺的工具调用已被安全丢弃（之前已完整生成的调用照常执行了）。请从中断处继续，不要重写已完成的部分：先根据最近一次成功的工具结果确认写到了哪（需要核实内容时用「读取」——应用暂存文件 type=app 带 path、仓库暂存 type=repo 带 path、草稿字段 type=game/theater 带 name，page 翻到最后一页看结尾），然后用「写入」append=true 接着追加。注意：中间段在语句边界断开即可，绝不要提前写 </script>、</body>、</html> 等收尾标签——收尾只属于最后一段，各段拼接后必须恰好是一份完整文件。";
+    "你上一条输出到达单次输出上限被截断，残缺的工具调用已被安全丢弃（之前已完整生成的调用照常执行了）。请从中断处继续：大内容改用「写入」append=true 分段追加，每段写到自然收尾就停，别硬凑一次写完。";
 const QA_AUTO_CONTINUE_MARKED =
     "收到你的 CONTINUE 标记，请从上次停下的地方继续写；全部完成后正常收尾（不要再输出 CONTINUE）。";
 const QA_CONTINUE_FALLBACK_PROMPT = "请基于以上结果继续回答用户的问题。";
@@ -432,13 +421,10 @@ function buildQaOutputBudgetPrompt(): string {
     lines.push("写入策略按优先级：");
     lines.push("① 改已有内容一律「编辑」（find/replace）——只输出改动片段，绝不整体重写大文件；");
     lines.push("② 新写内容正常一次写完即可，多数文件都在预算内，不必刻意分段；APP 的图片/字体/CSS 等资源拆成包内独立文件（「写入」type=app 按 path 多文件暂存），别 base64 塞进 index.html；");
-    lines.push("③ 只有单个文件/字段可能超出输出预算时（大游戏 gameHtml、超长剧场开场等），才用「写入」append=true 分段：首轮写开头、后续轮接着写，全部写完后「发布」；");
+    lines.push("③ 只有单个文件/字段可能超出输出预算时（大游戏 gameHtml、超长剧场开场等），才用「写入」append=true 分段：首轮骨架、后续轮追加、每段写到自然收尾（标签/函数闭合处）就停，全部写完后「发布」；");
     lines.push("④ 预算判断不准也没关系：写超被截断的残缺调用会被安全丢弃并自动让你续写，已完成的部分不会丢。");
     lines.push(
-        "分段的本质是把同一份文件切成几刀、原样拼回：每段在语句/子元素的边界断开即可，中间段绝不要写 </script>、</body>、</html> 这类收尾标签，也不要为了段落\"完整\"强行闭合还没写完的函数或标签——收尾只出现在最后一段，各段按顺序拼接后必须恰好是一份结构完整的文件（此前有 APP 因第一段提前写了 </html>，后面几万字全被浏览器当纯文本、按钮全部失灵）。",
-    );
-    lines.push(
-        "内容没写完、这条回复又不打算调用工具时，在正文末尾单独一行写 <!--CONTINUE-->，系统会自动让你继续；全部完成后正常收尾即可，不要输出 <!--CONTINUE-->。",
+        "每段写到自然收尾（标签、函数、语句的闭合处）就停，下一轮接着写。内容没写完、这条回复又不打算调用工具时，在正文末尾单独一行写 <!--CONTINUE-->，系统会自动让你继续；全部完成后正常收尾即可，不要输出 <!--CONTINUE-->。",
     );
     return lines.join("\n");
 }
@@ -467,8 +453,6 @@ export type QaContextEntry = {
     content: string;
     /** user：随消息附带的图片（dataURL）；识图未开启时适配层会自动降级为占位文本 */
     images?: string[];
-    /** user：随消息附带的纯文本或代码附件 */
-    files?: { name: string; content: string }[];
     /** assistant：原生协议的工具调用（文本协议轮次不填，指令已在 content 里） */
     toolCalls?: LlmToolCall[];
     /** tool：来源调用 id（原生轮次才有）与工具名 */
@@ -478,13 +462,11 @@ export type QaContextEntry = {
     turn?: string;
 };
 
-/** user 条目内容：先拼接文本附件；带图片时再转多模态 parts。 */
+/** user 条目内容：带图片时转多模态 parts（识图未开启由适配层降级为占位） */
 function userEntryContent(entry: QaContextEntry): string | LLMContentPart[] {
-    const fileBlocks = (entry.files ?? []).map((file) => `\n\n[附件：${file.name}]\n${file.content}`).join("");
-    const textContent = `${entry.content}${fileBlocks}`;
-    if (!entry.images?.length) return textContent;
+    if (!entry.images?.length) return entry.content;
     return [
-        { type: "text", text: textContent },
+        { type: "text", text: entry.content },
         ...entry.images.map((url) => ({ type: "image_url" as const, image_url: { url } })),
     ];
 }
@@ -542,16 +524,10 @@ export async function compactQaContext(entries: QaContextEntry[], options?: { si
     const lines = entries.map((entry) => {
         const head = entry.role === "user" ? "用户" : entry.role === "assistant" ? "助手" : `工具结果(${entry.name ?? "工具"})`;
         const body = entry.content.length > 4000 ? `${entry.content.slice(0, 4000)}…（截断）` : entry.content;
-        const files = entry.files?.length
-            ? `\n${entry.files.map((file) => {
-                const content = file.content.length > 4000 ? `${file.content.slice(0, 4000)}…（截断）` : file.content;
-                return `[附件：${file.name}]\n${content}`;
-            }).join("\n")}`
-            : "";
         const calls = entry.toolCalls?.length
             ? `\n[调用工具] ${entry.toolCalls.map((c) => `${c.name}(${JSON.stringify(c.args ?? {}).slice(0, 400)})`).join("；")}`
             : "";
-        return `【${head}】${body}${files}${calls}`;
+        return `【${head}】${body}${calls}`;
     });
     let transcript = lines.join("\n\n");
     if (transcript.length > 150_000) transcript = transcript.slice(-150_000);
@@ -660,7 +636,6 @@ async function callQaAgentText(apiConfig: ApiConfig, history: QaEngineMessage[],
             options?.onContext?.({ role: "tool", name: toolResult.name, content: block });
             resultBlocks.push(`【${toolResult.name}】${toolResult.success ? "" : "（失败）"}\n${toolResult.resultForModel}`);
         }
-        if (truncated || wantsContinue) await callbacks?.onAutoContinue?.(truncated ? "truncated" : "marked");
         const followUp = truncated ? QA_AUTO_CONTINUE_TRUNCATED : wantsContinue ? QA_AUTO_CONTINUE_MARKED : QA_CONTINUE_FALLBACK_PROMPT;
         working.push({
             role: "user",
@@ -681,7 +656,7 @@ async function callQaAgentNative(apiConfig: ApiConfig, history: QaEngineMessage[
     // 原生协议下工具经请求体声明，系统提示词只保留身份与行为规则
     const systemPrompt = [
         buildQaSystemPrompt(latestUser?.content ?? ""),
-        "你有原生工具可以调用（见请求中的 tools 定义）。排查问题先分诊再选工具，不要凭空猜测、也不要把工具挨个跑一遍：某个 APP/游戏/剧场自身行为不对是它的代码问题，「读取」源码定位；环境问题（API 连不上/存储满/页面崩溃/设备兼容）才用「环境体检」；产品用法问题查「答疑文档」。收到工具结果后用人话向用户解释结论和建议。",
+        "你有原生工具可以调用（见请求中的 tools 定义）。排查问题优先实际调用工具检测，不要凭空猜测；收到工具结果后用人话向用户解释结论和建议。",
         buildQaOutputBudgetPrompt(),
     ].join("\n\n");
     const working: LlmRequestMessage[] = options?.context
@@ -728,7 +703,12 @@ async function callQaAgentNative(apiConfig: ApiConfig, history: QaEngineMessage[
             if (options?.signal?.aborted) throw streamError;
             await callbacks?.onStreamFallback?.(formatQaErrorMessage(streamError));
             const fallbackRequest = buildProviderRequest(apiConfig, null, messages, { tools, maxTokens: getQaMaxOutputTokens() ?? undefined });
-            const response = await fetchLlmPayload(fallbackRequest, { signal: options?.signal });
+            const response = await fetch(fallbackRequest.url, {
+                method: "POST",
+                headers: fallbackRequest.headers,
+                body: JSON.stringify(fallbackRequest.body),
+                signal: options?.signal,
+            });
             if (!response.ok) throw new Error(`API ${response.status}: ${await response.text()}`);
             const parsed = parseProviderResponse(fallbackRequest.providerKind, await response.json());
             if (parsed.content) await filter.push(parsed.content);
@@ -740,22 +720,6 @@ async function callQaAgentNative(apiConfig: ApiConfig, history: QaEngineMessage[
                 rawResponse: "",
                 providerKind: fallbackRequest.providerKind,
             };
-            // 流式失败转非流式成功的这一跳也要进工坊「调用记录」：主路径（sendLLMToolStreamRequest）
-            // 由聊天引擎按 appId 分流落日志，这条 fallback 是本文件自己发的请求，不补就漏一条，
-            // 而恰恰是刚出过流式故障、最需要排障记录的场景。
-            pushApiLog({
-                characterName: "工坊",
-                source: "qa",
-                channel: "qa",
-                model: apiConfig.defaultModel,
-                messages: fallbackRequest.messagesForLog.map(m => ({
-                    role: m.role,
-                    content: typeof m.content === "string" ? m.content : "[vision: 含图片的多模态消息]",
-                })),
-                rawResponse: JSON.stringify({ content: result.content, reasoning: result.reasoning, toolCalls: result.toolCalls }),
-                reasoning: parsed.reasoning?.trim() || undefined,
-                usage: parsed.usage,
-            });
         }
         await filter.flush();
 
@@ -803,7 +767,6 @@ async function callQaAgentNative(apiConfig: ApiConfig, history: QaEngineMessage[
         }
 
         // 文本协议兜底调用：结果以 user 消息块回传；截断/CONTINUE 时把接力提示并入同一条
-        if (truncated || wantsContinue) await callbacks?.onAutoContinue?.(truncated ? "truncated" : "marked");
         const followUp = truncated ? QA_AUTO_CONTINUE_TRUNCATED : wantsContinue ? QA_AUTO_CONTINUE_MARKED : QA_CONTINUE_FALLBACK_PROMPT;
         if (textParsed.toolCalls.length > 0) {
             const resultBlocks: string[] = [];
