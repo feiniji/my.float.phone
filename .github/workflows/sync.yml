@@ -1,4 +1,4 @@
-name: Sync Fork with Upstreams
+*name: Sync Fork with Upstreams
 
 on:
   schedule:
@@ -31,4 +31,4 @@ jobs:
           git merge upstream-doremy/main --no-edit || { echo "❌ doremy 合并冲突，已安全中止，请手动解决"; exit 1; }
 
       - name: Push changes
-        run: git push origin main
+        run: git push origin test
